@@ -1,13 +1,16 @@
 (() => {
   const DATABASE_NAME = 'school-monitor-mooe';
-  const DATABASE_VERSION = 1;
+  const DATABASE_VERSION = 2;
   const RECORDS_STORE = 'records';
   const SETTINGS_STORE = 'settings';
+  const DELETED_STORE = 'recentlyDeleted';
+  const DELETED_VALIDITY_MS = 5 * 24 * 60 * 60 * 1000;
   const PHOTO_DIRECTORY_SETTING = 'photoDirectory';
   const fields = ['schoolId', 'schoolName', 'district', 'schoolType', 'contactPerson', 'status', 'jevNumber', 'remarks'];
   const validStatuses = ['Checked', 'Pending', 'Not Started'];
-  const initialRecords = window.schoolMonitoringData.records.map((row, index) => Object.fromEntries(fields.map((field, position) => [field, row[position] || '']).concat([['_key', `initial-${index}`]])));
+  const initialRecords = window.schoolMonitoringData.records.map((record, index) => Object.fromEntries(fields.map((field, position) => [field, (Array.isArray(record) ? record[position] : record[field]) || '']).concat([['_key', Array.isArray(record) ? `initial-${index}` : record._key || `initial-${index}`], ['photo', Array.isArray(record) ? '' : record.photo || '']])));
   let records = [];
+  let deletedRecords = [];
   let database;
   let photoDirectory;
   let activeKey = null;
@@ -35,6 +38,19 @@
     const photo = record.photo ?? '';
     if (typeof photo !== 'string' || (photo && !isValidPhoto(photo))) throw new Error('A school photo in this record is not a supported image format.');
     return Object.fromEntries(fields.map((field) => [field, String(record[field] ?? '')]).concat([['_key', String(record._key || createRecordKey())], ['photo', photo]]));
+  }
+
+  function normaliseDeletedRecord(record) {
+    const deletedAt = Date.parse(record?.deletedAt);
+    if (!Number.isFinite(deletedAt)) throw new Error('A recently deleted record has an invalid deletion date.');
+    return { ...normaliseRecord(record), deletedAt: new Date(deletedAt).toISOString() };
+  }
+
+  function getRecordsToArchive(currentRecords, nextRecords) {
+    return currentRecords.filter((record) => {
+      const replacement = nextRecords.find((item) => item._key === record._key);
+      return !replacement || fields.some((field) => replacement[field] !== record[field]) || replacement.photo !== record.photo;
+    });
   }
 
   function parseCsv(text) {
@@ -131,6 +147,7 @@
         const db = request.result;
         if (!db.objectStoreNames.contains(RECORDS_STORE)) db.createObjectStore(RECORDS_STORE, { keyPath: '_key' });
         if (!db.objectStoreNames.contains(SETTINGS_STORE)) db.createObjectStore(SETTINGS_STORE, { keyPath: 'key' });
+        if (!db.objectStoreNames.contains(DELETED_STORE)) db.createObjectStore(DELETED_STORE, { keyPath: '_key' });
       });
       request.addEventListener('success', () => resolve(request.result), { once: true });
       request.addEventListener('error', () => reject(request.error || new Error('Could not open browser storage.')), { once: true });
@@ -165,15 +182,28 @@
     await transactionDone(transaction);
   }
 
-  async function saveRecords(nextRecords = records) {
+  async function saveRecords(nextRecords = records, newlyDeleted = []) {
     try {
-      const transaction = database.transaction([RECORDS_STORE, SETTINGS_STORE], 'readwrite');
+      const transaction = database.transaction([RECORDS_STORE, SETTINGS_STORE, DELETED_STORE], 'readwrite');
       const store = transaction.objectStore(RECORDS_STORE);
       store.clear();
       nextRecords.forEach((record) => store.put(record));
+      const occupiedKeys = new Set([
+        ...nextRecords.map((record) => record._key),
+        ...deletedRecords.map((record) => record._key)
+      ]);
+      const archivedRecords = newlyDeleted.map((record) => {
+        const archivedRecord = { ...record };
+        if (occupiedKeys.has(archivedRecord._key)) archivedRecord._key = createRecordKey();
+        occupiedKeys.add(archivedRecord._key);
+        return archivedRecord;
+      });
+      const deletedAt = new Date().toISOString();
+      archivedRecords.forEach((record) => transaction.objectStore(DELETED_STORE).put({ ...record, deletedAt }));
       transaction.objectStore(SETTINGS_STORE).put({ key: 'recordsInitialized', value: true });
       await transactionDone(transaction);
       records = nextRecords;
+      deletedRecords = [...deletedRecords, ...archivedRecords.map((record) => ({ ...record, deletedAt }))];
       render();
       return true;
     } catch (error) {
@@ -181,6 +211,56 @@
       console.error(error);
       return false;
     }
+  }
+
+  async function restoreDeletedRecord(key) {
+    const record = deletedRecords.find((item) => item._key === key);
+    if (!record) return;
+    if (Date.parse(record.deletedAt) + DELETED_VALIDITY_MS <= Date.now()) {
+      await purgeExpiredDeletedRecords();
+      showToast(`${record.schoolName} has expired and can no longer be restored.`);
+      return;
+    }
+    const restoredRecord = { ...record };
+    delete restoredRecord.deletedAt;
+    if (records.some((item) => item._key === restoredRecord._key)) restoredRecord._key = createRecordKey();
+    const transaction = database.transaction([RECORDS_STORE, DELETED_STORE], 'readwrite');
+    transaction.objectStore(RECORDS_STORE).add(restoredRecord);
+    transaction.objectStore(DELETED_STORE).delete(key);
+    await transactionDone(transaction);
+    records = [restoredRecord, ...records];
+    deletedRecords = deletedRecords.filter((item) => item._key !== key);
+    render();
+    showToast(`${record.schoolName} restored to the tracker.`);
+  }
+
+  async function removeUnreferencedPhotos(candidates, requestPermission = true) {
+    const photos = [...new Set(candidates.map((record) => record.photo).filter((photo) => photo?.startsWith('file:')))];
+    const unusedPhotos = photos.filter((photo) => !records.some((record) => record.photo === photo) && !deletedRecords.some((record) => record.photo === photo));
+    const errors = [];
+    for (const photo of unusedPhotos) {
+      try {
+        await removePhotoFile(photo, requestPermission);
+      } catch (error) {
+        errors.push(error);
+        console.error(error);
+      }
+    }
+    return errors;
+  }
+
+  async function purgeExpiredDeletedRecords() {
+    const now = Date.now();
+    const expiredRecords = deletedRecords.filter((record) => Date.parse(record.deletedAt) + DELETED_VALIDITY_MS <= now);
+    if (!expiredRecords.length) return;
+    const expiredKeys = new Set(expiredRecords.map((record) => record._key));
+    const transaction = database.transaction(DELETED_STORE, 'readwrite');
+    expiredKeys.forEach((key) => transaction.objectStore(DELETED_STORE).delete(key));
+    await transactionDone(transaction);
+    deletedRecords = deletedRecords.filter((record) => !expiredKeys.has(record._key));
+    renderRecentlyDeleted();
+    const photoErrors = await removeUnreferencedPhotos(expiredRecords, false);
+    if (photoErrors.length) showToast(`Expired records were permanently removed, but ${photoErrors.length} photo file(s) could not be removed. Check photo-folder access.`);
   }
 
   async function initialize() {
@@ -213,8 +293,18 @@
       }
     }
     photoDirectory = await readSetting(PHOTO_DIRECTORY_SETTING);
+    const deletedTransaction = database.transaction(DELETED_STORE, 'readonly');
+    deletedRecords = (await requestResult(deletedTransaction.objectStore(DELETED_STORE).getAll())).map(normaliseDeletedRecord);
+    await transactionDone(deletedTransaction);
+    await purgeExpiredDeletedRecords();
     updatePhotoFolderStatus();
     render();
+    window.setInterval(() => {
+      purgeExpiredDeletedRecords().catch((error) => {
+        showToast('Expired records could not be removed from browser storage. Reload and try again.');
+        console.error(error);
+      });
+    }, 60 * 1000);
   }
 
   function updatePhotoFolderStatus() {
@@ -223,10 +313,10 @@
     document.querySelector('.local-indicator').innerHTML = '<i></i>Saved in this browser';
   }
 
-  async function ensurePhotoDirectoryPermission() {
+  async function ensurePhotoDirectoryPermission(requestAccess = true) {
     if (!photoDirectory) throw new Error('Choose a photo folder on your computer before adding a photo.');
     let permission = await photoDirectory.queryPermission({ mode: 'readwrite' });
-    if (permission !== 'granted') permission = await photoDirectory.requestPermission({ mode: 'readwrite' });
+    if (permission !== 'granted' && requestAccess) permission = await photoDirectory.requestPermission({ mode: 'readwrite' });
     if (permission !== 'granted') throw new Error('Permission to write to the selected photo folder was not granted. Choose the folder again to restore access.');
     return photoDirectory;
   }
@@ -251,9 +341,9 @@
     return `file:${filename}`;
   }
 
-  async function removePhotoFile(photo) {
+  async function removePhotoFile(photo, requestAccess = true) {
     if (!photo || !photo.startsWith('file:')) return;
-    const directory = await ensurePhotoDirectoryPermission();
+    const directory = await ensurePhotoDirectoryPermission(requestAccess);
     await directory.removeEntry(photo.slice(5));
   }
 
@@ -332,10 +422,34 @@
     }).join('');
   }
 
+  function renderRecentlyDeleted() {
+    const count = deletedRecords.length;
+    const countBadge = byId('recently-deleted-count');
+    countBadge.textContent = count;
+    countBadge.hidden = count === 0;
+    byId('deleted-result-count').textContent = `${count} deleted ${count === 1 ? 'record' : 'records'}`;
+    byId('recently-deleted-empty').hidden = count > 0;
+    byId('recently-deleted-body').innerHTML = [...deletedRecords]
+      .sort((a, b) => Date.parse(b.deletedAt) - Date.parse(a.deletedAt))
+      .map((record) => {
+        const deletedDate = new Date(record.deletedAt);
+        const expiresDate = new Date(deletedDate.getTime() + DELETED_VALIDITY_MS);
+        return `<tr>
+          <td class="id-cell">${escapeHtml(record.schoolId)}</td>
+          <td class="school-name-cell">${escapeHtml(record.schoolName)}</td>
+          <td>${escapeHtml(record.district)}</td>
+          <td>${escapeHtml(deletedDate.toLocaleString())}</td>
+          <td>${escapeHtml(expiresDate.toLocaleString())}</td>
+          <td class="deleted-actions"><button class="text-button" type="button" data-restore="${escapeHtml(record._key)}">Restore</button><button class="text-button delete-button" type="button" data-permanently-delete="${escapeHtml(record._key)}">Delete permanently</button></td>
+        </tr>`;
+      }).join('');
+  }
+
   function render() {
     renderOverview();
     renderFilterOptions();
     renderTable();
+    renderRecentlyDeleted();
   }
 
   function populateSelect(select, options, selected, placeholder) {
@@ -523,9 +637,11 @@
 
   function setView(view) {
     const showTracker = view === 'tracker';
-    byId('overview-view').hidden = showTracker;
+    const showRecentlyDeleted = view === 'recently-deleted';
+    byId('overview-view').hidden = showTracker || showRecentlyDeleted;
     byId('tracker-view').hidden = !showTracker;
-    byId('breadcrumb-current').textContent = showTracker ? 'School tracker' : 'Overview';
+    byId('recently-deleted-view').hidden = !showRecentlyDeleted;
+    byId('breadcrumb-current').textContent = showTracker ? 'School tracker' : showRecentlyDeleted ? 'Recently deleted' : 'Overview';
     document.querySelectorAll('.nav-link').forEach((button) => button.classList.toggle('is-active', button.dataset.view === view));
   }
 
@@ -534,6 +650,37 @@
     if (viewButton) setView(viewButton.dataset.view);
     const editButton = event.target.closest('[data-edit]');
     if (editButton) openEditor(records.find((record) => record._key === editButton.dataset.edit));
+    const restoreButton = event.target.closest('[data-restore]');
+    if (restoreButton) {
+      try {
+        await restoreDeletedRecord(restoreButton.dataset.restore);
+      } catch (error) {
+        showToast(error.message || 'Could not restore this record.');
+        console.error(error);
+      }
+      return;
+    }
+    const permanentlyDeleteButton = event.target.closest('[data-permanently-delete]');
+    if (permanentlyDeleteButton) {
+      const record = deletedRecords.find((item) => item._key === permanentlyDeleteButton.dataset.permanentlyDelete);
+      if (record && window.confirm(`Permanently delete ${record.schoolName}? This cannot be undone.`)) {
+        try {
+          const transaction = database.transaction(DELETED_STORE, 'readwrite');
+          transaction.objectStore(DELETED_STORE).delete(record._key);
+          await transactionDone(transaction);
+          deletedRecords = deletedRecords.filter((item) => item._key !== record._key);
+          render();
+          const photoErrors = await removeUnreferencedPhotos([record]);
+          showToast(photoErrors.length
+            ? `Record permanently deleted, but its photo could not be removed: ${photoErrors[0].message}`
+            : 'Record permanently deleted.');
+        } catch (error) {
+          showToast(error.message || 'Could not permanently delete this record.');
+          console.error(error);
+        }
+      }
+      return;
+    }
     const actionButton = event.target.closest('[data-action]');
     if (!actionButton) return;
     switch (actionButton.dataset.action) {
@@ -591,24 +738,17 @@
         break;
       case 'reset':
         if (window.confirm(`Restore the ${initialRecords.length} original records? This will remove local edits and additions.`)) {
-          if (await saveRecords(initialRecords.map(normaliseRecord))) showToast('Original workbook records restored.');
+          const restoredRecords = initialRecords.map(normaliseRecord);
+          const removedRecords = getRecordsToArchive(records, restoredRecords);
+          if (await saveRecords(restoredRecords, removedRecords)) showToast('Original workbook records restored.');
         }
         break;
       case 'delete': {
         const record = records.find((item) => item._key === activeKey);
         if (record && window.confirm(`Delete ${record.schoolName} from this browser?`)) {
-          if (await saveRecords(records.filter((item) => item._key !== activeKey))) {
-            let photoRemovalError;
-            if (record.photo?.startsWith('file:') && !records.some((item) => item.photo === record.photo)) {
-              try {
-                await removePhotoFile(record.photo);
-              } catch (error) {
-                photoRemovalError = error;
-                console.error(error);
-              }
-            }
+          if (await saveRecords(records.filter((item) => item._key !== activeKey), [record])) {
             byId('school-dialog').close();
-            showToast(photoRemovalError ? `Record deleted, but its photo could not be removed: ${photoRemovalError.message}` : 'Record deleted.');
+            showToast('Record moved to Recently deleted.');
           }
         }
         break;
@@ -629,7 +769,7 @@
       : [record, ...records];
     if (await saveRecords(nextRecords)) {
       let photoRemovalError;
-      if (previousPhoto?.startsWith('file:') && previousPhoto !== pendingPhoto && !nextRecords.some((item) => item.photo === previousPhoto)) {
+      if (previousPhoto?.startsWith('file:') && previousPhoto !== pendingPhoto && !nextRecords.some((item) => item.photo === previousPhoto) && !deletedRecords.some((item) => item.photo === previousPhoto)) {
         try {
           await removePhotoFile(previousPhoto);
         } catch (error) {
@@ -700,7 +840,9 @@
         const imported = Array.isArray(parsed) ? parsed : parsed?.records;
         if (!Array.isArray(imported) || imported.some((record) => !record || typeof record !== 'object' || fields.some((field) => typeof record[field] !== 'string') || !validStatuses.includes(record.status) || !record.schoolId.trim() || !record.schoolName.trim() || (record.photo !== undefined && typeof record.photo !== 'string'))) throw new Error('Backup format is invalid. Confirm that records include required fields and a valid status.');
         if (!window.confirm(`Replace the current tracker with ${imported.length} records from this backup?`)) return;
-        if (await saveRecords(imported.map(normaliseRecord))) showToast(`${imported.length} records imported.`);
+        const importedRecords = imported.map(normaliseRecord);
+        const removedRecords = getRecordsToArchive(records, importedRecords);
+        if (await saveRecords(importedRecords, removedRecords)) showToast(`${imported.length} records imported.`);
       }
     } catch (error) {
       showToast(error.message || 'Could not read this backup file.');
