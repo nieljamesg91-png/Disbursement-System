@@ -20,6 +20,7 @@
       <nav class="main-nav" aria-label="Main navigation">
         <button class="nav-link is-active" type="button" data-view="overview"><span class="nav-icon" aria-hidden="true">▦</span>Overview</button>
         <button class="nav-link" type="button" data-view="tracker"><span class="nav-icon" aria-hidden="true">≡</span>School tracker</button>
+        <button class="nav-link" type="button" data-view="recently-deleted"><span class="nav-icon" aria-hidden="true">↶</span>Recently deleted <span class="nav-count" id="recently-deleted-count" hidden>0</span></button>
       </nav>
       <div class="sidebar-tools" aria-label="Data tools">
         <button class="sidebar-tool" type="button" data-action="export-json"><span class="sidebar-tool-icon" aria-hidden="true">↓</span>Export JSON backup</button>
@@ -95,7 +96,7 @@
             <div id="attention-list" class="attention-list"></div>
           </section>
         </div>
-        <footer class="page-foot"><span>Records loaded from the original School Monitoring MOOE Web Disbursements workbook.</span><button class="text-button reset-button" type="button" data-action="reset">Restore original records</button></footer>
+        <footer class="page-foot"><span>Records loaded from the current school monitoring data backup.</span><button class="text-button reset-button" type="button" data-action="reset">Restore original records</button></footer>
       </section>
 
       <section class="view-panel" id="tracker-view" aria-labelledby="tracker-title" hidden>
@@ -119,6 +120,20 @@
           <div class="empty-state" id="empty-state" hidden><strong>No records match your filters</strong><span>Adjust your search or filters and try again.</span></div>
         </div>
         <footer class="page-foot"><button class="text-button reset-button" type="button" data-action="reset">Restore original records</button></footer>
+      </section>
+
+      <section class="view-panel" id="recently-deleted-view" aria-labelledby="recently-deleted-title" hidden>
+        <div class="page-heading">
+          <div><p class="eyebrow">RECOVERY</p><h1 id="recently-deleted-title">Recently deleted</h1><p class="page-subtitle">Deleted records are kept for 5 days, then automatically removed while the app is open or the next time it is opened.</p></div>
+        </div>
+        <div class="table-meta"><span id="deleted-result-count">0 deleted records</span><span>Records expire 5 days after deletion.</span></div>
+        <div class="table-wrap">
+          <table class="recently-deleted-table">
+            <thead><tr><th scope="col">SCHOOL ID</th><th scope="col">SCHOOL NAME</th><th scope="col">DISTRICT</th><th scope="col">DELETED</th><th scope="col">EXPIRES</th><th scope="col">ACTIONS</th></tr></thead>
+            <tbody id="recently-deleted-body"></tbody>
+          </table>
+          <div class="empty-state" id="recently-deleted-empty"><strong>No recently deleted records</strong><span>Deleted school records will appear here for 5 days.</span></div>
+        </div>
       </section>
     </main>
   </div>
